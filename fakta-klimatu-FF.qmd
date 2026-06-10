@@ -18,8 +18,6 @@ library(patchwork)
 
 ## Import dat
 
-When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
-
 ```{r}
 owid_kaya_data <- read.csv("/cloud/project/Data/kaya-identity-co2.csv")
 head(owid_kaya_data)
@@ -730,4 +728,148 @@ for (current_country in country_list) {
 }
 
 message("All individual country files successfully saved!")
+```
+
+```{r}
+# ==============================================================================
+# GLOBAL KAYA PROFILE K-MEANS CLUSTERING (OUTPUTTING ALL COUNTRIES)
+# ==============================================================================
+
+library(tidyverse)
+
+# ------------------------------------------------------------------------------
+# STEP 1: CALCULATE ANNUAL PERCENTAGE CONTRIBUTION PROFILES FOR ALL COUNTRIES
+# ------------------------------------------------------------------------------
+df_global_lmdi <- owid_kaya_data %>%
+  filter(
+    !is.na(population), 
+    !is.na(gdp_percap), 
+    !is.na(energy_intensity), 
+    !is.na(carbon_intensity_co2_energy),
+    !is.na(co2_emissions),
+    Year >= 1994
+  ) %>%
+  group_by(Entity) %>%
+  arrange(Year, .by_group = TRUE) %>%
+  mutate(
+    p = population,
+    g = gdp_percap,
+    i = energy_intensity,
+    f = carbon_intensity_co2_energy,
+    
+    co2_t1 = lag(co2_emissions),
+    p_t1   = lag(p),
+    g_t1   = lag(g),
+    i_t1   = lag(i),
+    f_t1   = lag(f),
+    
+    delta_co2 = co2_emissions - co2_t1,
+    w_t = if_else(delta_co2 == 0, co2_emissions, delta_co2 / (log(co2_emissions) - log(co2_t1))),
+    
+    pct_p = ((w_t * log(p / p_t1)) / co2_t1) * 100,
+    pct_g = ((w_t * log(g / g_t1)) / co2_t1) * 100,
+    pct_i = ((w_t * log(i / i_t1)) / co2_t1) * 100,
+    pct_f = ((w_t * log(f / f_t1)) / co2_t1) * 100
+  ) %>%
+  filter(!is.na(co2_t1)) %>%
+  ungroup()
+
+# ------------------------------------------------------------------------------
+# STEP 2: CONSOLIDATE DATA INTO COUNTRY-LEVEL PROFILES
+# ------------------------------------------------------------------------------
+df_country_profiles <- df_global_lmdi %>%
+  group_by(Entity) %>%
+  summarise(
+    mean_p = mean(pct_p, na.rm = TRUE),
+    mean_g = mean(pct_g, na.rm = TRUE),
+    mean_i = mean(pct_i, na.rm = TRUE),
+    mean_f = mean(pct_f, na.rm = TRUE),
+    years_recorded = n()
+  ) %>%
+  filter(years_recorded >= 10, is.finite(mean_p), is.finite(mean_g))
+
+# ------------------------------------------------------------------------------
+# STEP 3: EXECUTE K-MEANS CLUSTERING (4 DISTINCT STRATEGIC GROUPS)
+# ------------------------------------------------------------------------------
+set.seed(42) 
+
+matrix_clustering_features <- df_country_profiles %>%
+  select(mean_p, mean_g, mean_i, mean_f)
+
+model_kmeans <- kmeans(matrix_clustering_features, centers = 4, nstart = 25)
+df_country_profiles$assigned_cluster <- as.factor(model_kmeans$cluster)
+
+# ------------------------------------------------------------------------------
+# STEP 4: INTERPRET GROUPS BY CREATING THE VISUAL PROFILES
+# ------------------------------------------------------------------------------
+df_cluster_centers_long <- df_country_profiles %>%
+  group_by(assigned_cluster) %>%
+  summarise(
+    `Population Growth`              = mean(mean_p),
+    `Economic Affluence (GDP/Cap)`   = mean(mean_g),
+    `Energy Intensity (Energy/GDP)`  = mean(mean_i),
+    `Carbon Intensity (CO2/Energy)`  = mean(mean_f)
+  ) %>%
+  pivot_longer(
+    cols = -assigned_cluster, 
+    names_to = "kaya_driver", 
+    values_to = "average_annual_pct_point_contribution"
+  )
+
+plot_clusters <- ggplot(df_cluster_centers_long, aes(x = kaya_driver, y = average_annual_pct_point_contribution, fill = kaya_driver)) +
+  geom_col(show.legend = FALSE) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 0.4) +
+  facet_wrap(~ assigned_cluster, labeller = label_both) +
+  labs(
+    title = "Global Clustering of Emission Drivers (1994-2022)",
+    subtitle = "Strategic groups partitioned via K-means analysis of historical Kaya LMDI profiles",
+    x = "Kaya Identity Component",
+    y = "Average Annual Contribution (Percentage Points)"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(face = "bold", size = 15, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    axis.text.x = element_text(angle = 30, hjust = 1, size = 9),
+    strip.text = element_text(face = "bold", size = 11, color = "#2c3e50")
+  ) +
+  scale_fill_brewer(palette = "Set2")
+
+ggsave(
+  filename = "kaya_global_clusters.png",
+  plot = plot_clusters,
+  width = 29.7,
+  height = 21.0,
+  units = "cm",
+  dpi = 300
+)
+
+# ------------------------------------------------------------------------------
+# STEP 5: OUTPUT ALL COUNTRIES PER CLUSTER AND EXPORT AS SPREADSHEET
+# ------------------------------------------------------------------------------
+cat("\n========================================================================\n")
+cat("COMPLETE STRUCTURAL ANALYSIS: LIST OF COUNTRIES PER CLUSTER\n")
+cat("========================================================================\n")
+
+for (cluster_idx in 1:4) {
+  # Collect and alphabetize all countries belonging to the active cluster loop
+  all_countries <- df_country_profiles %>%
+    filter(assigned_cluster == cluster_idx) %>%
+    arrange(Entity) %>%
+    pull(Entity)
+  
+  cat(paste0("\n--- CLUSTER ", cluster_idx, " (Total: ", length(all_countries), " countries) ---\n"))
+  
+  # Clean layout trick: collapses into a string and breaks nicely at 80 characters wide
+  formatted_text_block <- strwrap(paste(all_countries, collapse = ", "), width = 80)
+  cat(paste(formatted_text_block, collapse = "\n"), "\n")
+}
+
+# Compile a master lookup table and write it to a CSV file
+df_cluster_results <- df_country_profiles %>%
+  select(Entity, assigned_cluster, mean_p, mean_g, mean_i, mean_f) %>%
+  arrange(assigned_cluster, Entity)
+
+write_csv(df_cluster_results, "kaya_global_cluster_assignments.csv")
+message("\nSuccess! The complete country assignment list has been saved as 'kaya_global_cluster_assignments.csv'.")
 ```
