@@ -1,0 +1,733 @@
+---
+title: "Kaya decomposition pro Fakta o klimatu"
+author: "František Ficek"
+date: "June 10 2026"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+library(gt)
+library(knitr)
+library(readxl)
+library(here)
+library(patchwork)
+
+```
+
+## Import dat
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+owid_kaya_data <- read.csv("/cloud/project/Data/kaya-identity-co2.csv")
+head(owid_kaya_data)
+tail(owid_kaya_data)
+```
+
+```{r}
+head(owid_kaya_data)
+tail(owid_kaya_data)
+glimpse(owid_kaya_data)
+```
+
+```{r}
+country_name <- "United States"
+
+# filter out na and sort by year
+df_cleaned_owid <- owid_kaya_data %>%
+  filter(Entity == country_name) %>%
+  filter(
+    !is.na(population), 
+    !is.na(gdp_percap), 
+    !is.na(energy_intensity), 
+    !is.na(carbon_intensity_co2_energy),
+    !is.na(co2_emissions)
+  ) %>%
+  arrange(Year)
+
+print(paste("Number of complete years available for analysis:", nrow(df_cleaned_owid)))
+head(df_cleaned_owid)
+
+# available years check
+df_cleaned_owid %>% 
+  summarise(
+    first_year = min(Year), 
+    last_year = max(Year)
+  )
+
+# select desired years
+df_target_range <- df_cleaned_owid %>%
+  filter(Year >= 1994 & Year <= max(Year))
+
+
+print(paste("Number of continuous years in the analysis range:", nrow(df_target_range)))
+print(paste("Years range from", min(df_target_range$Year), "to", max(df_target_range$Year)))
+```
+
+```{r}
+# mutate variables to standard kaya
+df_kaya_factors <- df_target_range %>%
+  mutate(
+    p = population,                                
+    g = gdp_percap,                                
+    i = energy_intensity,                          
+    f = carbon_intensity_co2_energy,               
+    
+    # Raw identity product in t
+    kaya_product = (p * g * i * f) / 1000000,
+    
+    # Discrepancy residual for every individual year
+    r = co2_emissions / kaya_product
+  ) %>%
+  select(Entity, Year, co2_emissions, p, g, i, f, r)
+
+# Preview the factor timeline
+head(df_kaya_factors, 10)
+```
+
+```{r}
+df_lmdi_pct <- df_kaya_factors %>%
+  mutate(
+    # 1. Create lagged columns to line up year t-1 next to year t
+    co2_t1     = lag(co2_emissions),
+    p_t1       = lag(p),
+    g_t1       = lag(g),
+    i_t1       = lag(i),
+    f_t1       = lag(f),
+    r_t1       = lag(r),
+    year_start = lag(Year),
+    year_end   = Year
+  ) %>%
+  # Drop the very first row (1994) since it has no baseline year
+  filter(!is.na(co2_t1)) %>%
+  
+  # 2. Compute absolute LMDI effects first
+  mutate(
+    delta_co2 = co2_emissions - co2_t1,
+    w_t = if_else(delta_co2 == 0, co2_emissions, delta_co2 / (log(co2_emissions) - log(co2_t1))),
+    
+    effect_population        = w_t * log(p / p_t1),
+    effect_affluence         = w_t * log(g / g_t1),
+    effect_energy_intensity  = w_t * log(i / i_t1),
+    effect_carbon_intensity  = w_t * log(f / f_t1),
+    effect_residual          = w_t * log(r / r_t1)
+  ) %>%
+  
+  # 3. Convert absolute effects into percentage contributions relative to base year emissions (co2_t1)
+  mutate(
+    # Total actual % change of emissions
+    pct_change_co2              = (delta_co2 / co2_t1) * 100,
+    
+    # % contribution of each individual driver
+    pct_effect_population       = (effect_population / co2_t1) * 100,
+    pct_effect_affluence        = (effect_affluence / co2_t1) * 100,
+    pct_effect_energy_intensity = (effect_energy_intensity / co2_t1) * 100,
+    pct_effect_carbon_intensity = (effect_carbon_intensity / co2_t1) * 100,
+    pct_effect_residual         = (effect_residual / co2_t1) * 100,
+    
+    # Verification sum (should equal pct_change_co2 exactly)
+    sum_pct_effects = pct_effect_population + pct_effect_affluence + pct_effect_energy_intensity + 
+      pct_effect_carbon_intensity + pct_effect_residual
+  ) %>%
+  
+  # 4. Clean up the table to isolate the percentage metrics
+  select(year_start, year_end, pct_change_co2, pct_effect_population, pct_effect_affluence, 
+         pct_effect_energy_intensity, pct_effect_carbon_intensity, pct_effect_residual, sum_pct_effects)
+
+# View the percentage decomposition table
+head(df_lmdi_pct)
+```
+
+```{r}
+# 1. Reshape the data from wide to long format for ggplot
+df_lmdi_pct_long <- df_lmdi_pct %>%
+  select(year_end, pct_effect_population, pct_effect_affluence, 
+         pct_effect_energy_intensity, pct_effect_carbon_intensity, pct_effect_residual) %>%
+  pivot_longer(
+    cols = starts_with("pct_effect_"), 
+    names_to = "socioeconomic_driver", 
+    values_to = "percentage_contribution"
+  ) %>%
+  # 2. Clean up the label names for the chart legend to make them presentable
+  mutate(socioeconomic_driver = case_when(
+    socioeconomic_driver == "pct_effect_population"       ~ "Population Growth",
+    socioeconomic_driver == "pct_effect_affluence"        ~ "Economic Affluence (GDP/Capita)",
+    socioeconomic_driver == "pct_effect_energy_intensity" ~ "Energy Intensity (Energy/GDP)",
+    socioeconomic_driver == "pct_effect_carbon_intensity" ~ "Carbon Intensity (CO2/Energy)",
+    socioeconomic_driver == "pct_effect_residual"         ~ "Data Discrepancy Residual"
+  ))
+
+# 3. Create the stacked bar chart for percentage contributions
+ggplot(df_lmdi_pct_long, aes(x = year_end, y = percentage_contribution, fill = socioeconomic_driver)) +
+  geom_col() + 
+  geom_hline(yintercept = 0, color = "black", size = 0.5) + 
+  labs(
+    title = paste("Kaya Identity LMDI Decomposition:", country_name),
+    subtitle = "Annual percentage point contributions to total CO₂ emissions change (1994-2022)",
+    x = "Year",
+    y = "Contribution to Emissions Change (Percentage Points)",
+    fill = "Kaya Identity Component"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  scale_fill_brewer(palette = "Set2")
+```
+
+```{r}
+#LOOPED CHART MAKER
+
+# 1. Define the vector of countries you want to analyze
+country_list <- c("United States", "Germany", "China", "Brazil", "Angola", "Laos", "Czechia")
+
+
+# 2. Execute the loop across each country in your list
+for (current_country in country_list) {
+  
+  message(paste("Processing Kaya LMDI decomposition for:", current_country))
+  
+  # ----------------------------------------------------------------------------
+  # STEP 3: FILTER AND CLEAN DATA FOR THE CURRENT COUNTRY
+  # ----------------------------------------------------------------------------
+  df_cleaned_owid <- owid_kaya_data %>%
+    filter(Entity == current_country) %>%
+    filter(
+      !is.na(population), 
+      !is.na(gdp_percap), 
+      !is.na(energy_intensity), 
+      !is.na(carbon_intensity_co2_energy),
+      !is.na(co2_emissions)
+    ) %>%
+    arrange(Year)
+  
+  # Extract the continuous range from 1994 onwards
+  df_target_range <- df_cleaned_owid %>%
+    filter(Year >= 1994 & Year <= max(Year))
+  
+  # Safety Check: Skip the country if there isn't enough historical data points
+  if (nrow(df_target_range) < 2) {
+    warning(paste("Not enough continuous data points from 1994 onwards for", current_country, "- skipping."))
+    next
+  }
+  
+  # Capture the latest available year dynamically for chart subtitles
+  latest_year <- max(df_target_range$Year)
+  
+  # ----------------------------------------------------------------------------
+  # STEP 4: DEFINE KAYA FACTORS AND ACCOUNTING RESIDUAL (r)
+  # ----------------------------------------------------------------------------
+  df_kaya_factors <- df_target_range %>%
+    mutate(
+      p = population,                                
+      g = gdp_percap,                                
+      i = energy_intensity,                          
+      f = carbon_intensity_co2_energy,               
+      
+      # Raw identity product (scaled to Tonnes)
+      kaya_product = (p * g * i * f) / 1000000,
+      
+      # Discrepancy residual for every individual year
+      r = co2_emissions / kaya_product
+    ) %>%
+    select(Entity, Year, co2_emissions, p, g, i, f, r)
+  
+  # ----------------------------------------------------------------------------
+  # STEPS 5 & 7: CALCULATE YEAR-OVER-YEAR LMDI PERCENTAGE EFFECTS
+  # ----------------------------------------------------------------------------
+  df_lmdi_pct <- df_kaya_factors %>%
+    mutate(
+      co2_t1     = lag(co2_emissions),
+      p_t1       = lag(p),
+      g_t1       = lag(g),
+      i_t1       = lag(i),
+      f_t1       = lag(f),
+      r_t1       = lag(r),
+      year_start = lag(Year),
+      year_end   = Year
+    ) %>%
+    filter(!is.na(co2_t1)) %>%
+    mutate(
+      # Absolute change and Logarithmic Weight
+      delta_co2 = co2_emissions - co2_t1,
+      w_t = if_else(delta_co2 == 0, co2_emissions, delta_co2 / (log(co2_emissions) - log(co2_t1))),
+      
+      # Absolute effects
+      effect_population        = w_t * log(p / p_t1),
+      effect_affluence         = w_t * log(g / g_t1),
+      effect_energy_intensity  = w_t * log(i / i_t1),
+      effect_carbon_intensity  = w_t * log(f / f_t1),
+      effect_residual          = w_t * log(r / r_t1),
+      
+      # Convert absolute effects into baseline-relative percentage points
+      pct_effect_population       = (effect_population / co2_t1) * 100,
+      pct_effect_affluence        = (effect_affluence / co2_t1) * 100,
+      pct_effect_energy_intensity = (effect_energy_intensity / co2_t1) * 100,
+      pct_effect_carbon_intensity = (effect_carbon_intensity / co2_t1) * 100,
+      pct_effect_residual         = (effect_residual / co2_t1) * 100,
+      
+      # Actual total net % change of emissions
+      pct_change_co2              = (delta_co2 / co2_t1) * 100
+    )
+  
+  # ----------------------------------------------------------------------------
+  # STEPS 6 & 8: RESHAPE AND VISUALIZE THE RESULTS
+  # ----------------------------------------------------------------------------
+  df_lmdi_pct_long <- df_lmdi_pct %>%
+    select(year_end, pct_effect_population, pct_effect_affluence, 
+           pct_effect_energy_intensity, pct_effect_carbon_intensity, pct_effect_residual) %>%
+    pivot_longer(
+      cols = starts_with("pct_effect_"), 
+      names_to = "socioeconomic_driver", 
+      values_to = "percentage_contribution"
+    ) %>%
+    mutate(socioeconomic_driver = case_when(
+      socioeconomic_driver == "pct_effect_population"       ~ "Population Growth",
+      socioeconomic_driver == "pct_effect_affluence"        ~ "Economic Affluence (GDP/Capita)",
+      socioeconomic_driver == "pct_effect_energy_intensity" ~ "Energy Intensity (Energy/GDP)",
+      socioeconomic_driver == "pct_effect_carbon_intensity" ~ "Carbon Intensity (CO2/Energy)",
+      socioeconomic_driver == "pct_effect_residual"         ~ "Data Discrepancy Residual"
+    ))
+  
+  # Construct the percentage chart with an overlaid net-change line
+  pct_plot <- ggplot() +
+    # 1. Add the stacked columns for individual drivers
+    geom_col(
+      data = df_lmdi_pct_long, 
+      aes(x = year_end, y = percentage_contribution, fill = socioeconomic_driver)
+    ) + 
+    
+    # 2. Overlay the line showing net emissions change
+    geom_line(
+      data = df_lmdi_pct, 
+      aes(x = year_end, y = pct_change_co2, group = 1, color = "Net CO₂ Change"), 
+      linewidth = 1
+    ) +
+    
+    # 3. Add points on the line
+    geom_point(
+      data = df_lmdi_pct, 
+      aes(x = year_end, y = pct_change_co2, color = "Net CO₂ Change"), 
+      size = 1.8
+    ) +
+    
+    # 4. Styling, axes, and cosmetic layers (COMPACTED LEGEND DESIGN)
+    geom_hline(yintercept = 0, color = "black", size = 0.5) + 
+    labs(
+      title = paste("Kaya Identity LMDI Decomposition:", current_country),
+      subtitle = paste0("Annual percentage point contributions vs. total net CO₂ change (1994-", latest_year, ")"),
+      x = "Year",
+      y = "Emissions Change (Percentage Points / %)",
+      fill = "Kaya Identity Component",
+      color = "Total Trend"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      legend.box = "vertical", 
+      legend.margin = margin(t = 2, r = 0, b = 2, l = 0, unit = "pt"),
+      legend.text = element_text(size = 7.5),                 # Shrinks text of legend elements
+      legend.title = element_text(size = 8.5, face = "bold"),  # Shrinks font of titles
+      legend.key.size = unit(0.35, "cm"),                     # Makes colored boxes smaller
+      legend.spacing.y = unit(0.05, "cm"),                    # Shrinks vertical space between rows
+      plot.title = element_text(face = "bold", size = 14),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    ) +
+    scale_fill_brewer(palette = "Set2") +
+    scale_color_manual(values = c("Net CO₂ Change" = "#2c3e50")) +
+    
+    # Wrap elements into 2 clean rows and center titles to prevent horizontal clipping
+    guides(
+      fill = guide_legend(nrow = 2, title.position = "top", title.hjust = 0.5),
+      color = guide_legend(title.position = "top", title.hjust = 0.5)
+    )
+  
+  # Explicitly print the plot inside the loop execution context
+  print(pct_plot)
+}
+```
+
+```{r}
+# 6-in-1 chart maker and outputter
+
+library(tidyverse)
+library(patchwork)
+
+# 1. Define your target list of 6 countries
+country_list <- c("United States", "Germany", "China", "Brazil", "India", "United Kingdom")
+
+# 2. Initialize an empty list to store the generated plots
+saved_plots_list <- list()
+
+# 3. Execute the loop to process data and construct individual plots
+for (current_country in country_list) {
+  
+  message(paste("Processing Kaya LMDI decomposition for:", current_country))
+  
+  # ----------------------------------------------------------------------------
+  # STEP 3: FILTER AND CLEAN DATA FOR THE CURRENT COUNTRY
+  # ----------------------------------------------------------------------------
+  df_cleaned_owid <- owid_kaya_data %>%
+    filter(Entity == current_country) %>%
+    filter(
+      !is.na(population), 
+      !is.na(gdp_percap), 
+      !is.na(energy_intensity), 
+      !is.na(carbon_intensity_co2_energy),
+      !is.na(co2_emissions)
+    ) %>%
+    arrange(Year)
+  
+  # Extract the continuous range from 1994 onwards
+  df_target_range <- df_cleaned_owid %>%
+    filter(Year >= 1994 & Year <= max(Year))
+  
+  # Safety Check: Skip the country if there isn't enough historical data points
+  if (nrow(df_target_range) < 2) {
+    warning(paste("Not enough continuous data points from 1994 onwards for", current_country, "- skipping."))
+    next
+  }
+  
+  # Capture latest year dynamically for subtitles
+  latest_year <- max(df_target_range$Year)
+  
+  # ----------------------------------------------------------------------------
+  # STEP 4: DEFINE KAYA FACTORS AND ACCOUNTING RESIDUAL (r)
+  # ----------------------------------------------------------------------------
+  df_kaya_factors <- df_target_range %>%
+    mutate(
+      p = population,                                
+      g = gdp_percap,                                
+      i = energy_intensity,                          
+      f = carbon_intensity_co2_energy,               
+      
+      # Raw identity product (scaled to Tonnes)
+      kaya_product = (p * g * i * f) / 1000000,
+      
+      # Discrepancy residual for every individual year
+      r = co2_emissions / kaya_product
+    ) %>%
+    select(Entity, Year, co2_emissions, p, g, i, f, r)
+  
+  # ----------------------------------------------------------------------------
+  # STEPS 5 & 7: CALCULATE YEAR-OVER-YEAR LMDI PERCENTAGE EFFECTS
+  # ----------------------------------------------------------------------------
+  df_lmdi_pct <- df_kaya_factors %>%
+    mutate(
+      co2_t1     = lag(co2_emissions),
+      p_t1       = lag(p),
+      g_t1       = lag(g),
+      i_t1       = lag(i),
+      f_t1       = lag(f),
+      r_t1       = lag(r),
+      year_start = lag(Year),
+      year_end   = Year
+    ) %>%
+    filter(!is.na(co2_t1)) %>%
+    mutate(
+      # Absolute change and Logarithmic Weight
+      delta_co2 = co2_emissions - co2_t1,
+      w_t = if_else(delta_co2 == 0, co2_emissions, delta_co2 / (log(co2_emissions) - log(co2_t1))),
+      
+      # Absolute effects
+      effect_population        = w_t * log(p / p_t1),
+      effect_affluence         = w_t * log(g / g_t1),
+      effect_energy_intensity  = w_t * log(i / i_t1),
+      effect_carbon_intensity  = w_t * log(f / f_t1),
+      effect_residual          = w_t * log(r / r_t1),
+      
+      # Convert absolute effects into baseline-relative percentage points
+      pct_effect_population       = (effect_population / co2_t1) * 100,
+      pct_effect_affluence        = (effect_affluence / co2_t1) * 100,
+      pct_effect_energy_intensity = (effect_energy_intensity / co2_t1) * 100,
+      pct_effect_carbon_intensity = (effect_carbon_intensity / co2_t1) * 100,
+      pct_effect_residual         = (effect_residual / co2_t1) * 100,
+      
+      # Actual total net % change of emissions
+      pct_change_co2              = (delta_co2 / co2_t1) * 100
+    )
+  
+  # ----------------------------------------------------------------------------
+  # STEPS 6 & 8: RESHAPE AND VISUALIZE THE RESULTS
+  # ----------------------------------------------------------------------------
+  df_lmdi_pct_long <- df_lmdi_pct %>%
+    select(year_end, pct_effect_population, pct_effect_affluence, 
+           pct_effect_energy_intensity, pct_effect_carbon_intensity, pct_effect_residual) %>%
+    pivot_longer(
+      cols = starts_with("pct_effect_"), 
+      names_to = "socioeconomic_driver", 
+      values_to = "percentage_contribution"
+    ) %>%
+    mutate(socioeconomic_driver = case_when(
+      socioeconomic_driver == "pct_effect_population"       ~ "Population Growth",
+      socioeconomic_driver == "pct_effect_affluence"        ~ "Economic Affluence (GDP/Capita)",
+      socioeconomic_driver == "pct_effect_energy_intensity" ~ "Energy Intensity (Energy/GDP)",
+      socioeconomic_driver == "pct_effect_carbon_intensity" ~ "Carbon Intensity (CO2/Energy)",
+      socioeconomic_driver == "pct_effect_residual"         ~ "Data Discrepancy Residual"
+    ))
+  
+  # Construct the individual percentage chart
+  pct_plot <- ggplot() +
+    geom_col(
+      data = df_lmdi_pct_long, 
+      aes(x = year_end, y = percentage_contribution, fill = socioeconomic_driver)
+    ) + 
+    geom_line(
+      data = df_lmdi_pct, 
+      aes(x = year_end, y = pct_change_co2, group = 1, color = "Net CO₂ Change"), 
+      linewidth = 0.7
+    ) +
+    geom_point(
+      data = df_lmdi_pct, 
+      aes(x = year_end, y = pct_change_co2, color = "Net CO₂ Change"), 
+      size = 1.2
+    ) +
+    geom_hline(yintercept = 0, color = "black", size = 0.4) + 
+    labs(
+      title = current_country, 
+      x = "Year",
+      y = "Change (Percentage Points / %)",
+      fill = "Kaya Identity Component",
+      color = "Total Trend"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(face = "bold", size = 11),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+      axis.text.y = element_text(size = 7),
+      axis.title.x = element_text(size = 8),
+      axis.title.y = element_text(size = 8)
+    ) +
+    scale_fill_brewer(palette = "Set2") +
+    scale_color_manual(values = c("Net CO₂ Change" = "#2c3e50"))
+  
+  saved_plots_list[[current_country]] <- pct_plot
+}
+
+# ------------------------------------------------------------------------------
+# COMPILE THE FINAL GRID 
+# ------------------------------------------------------------------------------
+final_grid_chart <- wrap_plots(saved_plots_list, ncol = 2, nrow = 3) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "Comparative Cross-Country Kaya Identity LMDI Decomposition",
+    subtitle = "Annual drivers of emissions vs. total absolute net percentage change (1994-2022)",
+    theme = theme(
+      plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+      plot.subtitle = element_text(size = 11, hjust = 0.5)
+    )
+  ) &
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.text = element_text(size = 8),
+    legend.title = element_text(size = 9, face = "bold"),
+    legend.key.size = unit(0.35, "cm")
+  )
+
+# ------------------------------------------------------------------------------
+# SAVE TO A4 LANDSCAPE FILE
+# ------------------------------------------------------------------------------
+# Standard A4 size is 29.7 x 21.0 cm. 
+# You can change the extension to ".pdf" if you prefer vector graphic format!
+ggsave(
+  filename = "kaya_lmdi_decomposition_grid.png", 
+  plot = final_grid_chart, 
+  width = 29.7, 
+  height = 21.0, 
+  units = "cm", 
+  dpi = 300
+)
+
+message("Success! The layout has been saved to your workspace files as 'kaya_lmdi_decomposition_grid.png'.")
+```
+
+```{r}
+# individual country outputter
+
+library(tidyverse)
+
+# 1. Define the vector of countries you want to analyze
+country_list <- c("United States", "Germany", "China", "Brazil", "India", "Laos", "Czechia", "Japan", "South Korea", "Angola", "Kenya")
+
+
+# 2. Execute the loop across each country in your list
+for (current_country in country_list) {
+  
+  message(paste("Processing Kaya LMDI decomposition for:", current_country))
+  
+  # ----------------------------------------------------------------------------
+  # STEP 3: FILTER AND CLEAN DATA FOR THE CURRENT COUNTRY
+  # ----------------------------------------------------------------------------
+  df_cleaned_owid <- owid_kaya_data %>%
+    filter(Entity == current_country) %>%
+    filter(
+      !is.na(population), 
+      !is.na(gdp_percap), 
+      !is.na(energy_intensity), 
+      !is.na(carbon_intensity_co2_energy),
+      !is.na(co2_emissions)
+    ) %>%
+    arrange(Year)
+  
+  # Extract the continuous range from 1994 onwards
+  df_target_range <- df_cleaned_owid %>%
+    filter(Year >= 1994 & Year <= max(Year))
+  
+  # Safety Check: Skip the country if there isn't enough historical data points
+  if (nrow(df_target_range) < 2) {
+    warning(paste("Not enough continuous data points from 1994 onwards for", current_country, "- skipping."))
+    next
+  }
+  
+  # Capture latest year dynamically for chart subtitles
+  latest_year <- max(df_target_range$Year)
+  
+  # ----------------------------------------------------------------------------
+  # STEP 4: DEFINE KAYA FACTORS AND ACCOUNTING RESIDUAL (r)
+  # ----------------------------------------------------------------------------
+  df_kaya_factors <- df_target_range %>%
+    mutate(
+      p = population,                                
+      g = gdp_percap,                                
+      i = energy_intensity,                          
+      f = carbon_intensity_co2_energy,               
+      
+      # Raw identity product (scaled to Tonnes)
+      kaya_product = (p * g * i * f) / 1000000,
+      
+      # Discrepancy residual for every individual year
+      r = co2_emissions / kaya_product
+    ) %>%
+    select(Entity, Year, co2_emissions, p, g, i, f, r)
+  
+  # ----------------------------------------------------------------------------
+  # STEPS 5 & 7: CALCULATE YEAR-OVER-YEAR LMDI PERCENTAGE EFFECTS
+  # ----------------------------------------------------------------------------
+  df_lmdi_pct <- df_kaya_factors %>%
+    mutate(
+      co2_t1     = lag(co2_emissions),
+      p_t1       = lag(p),
+      g_t1       = lag(g),
+      i_t1       = lag(i),
+      f_t1       = lag(f),
+      r_t1       = lag(r),
+      year_start = lag(Year),
+      year_end   = Year
+    ) %>%
+    filter(!is.na(co2_t1)) %>%
+    mutate(
+      # Absolute change and Logarithmic Weight
+      delta_co2 = co2_emissions - co2_t1,
+      w_t = if_else(delta_co2 == 0, co2_emissions, delta_co2 / (log(co2_emissions) - log(co2_t1))),
+      
+      # Absolute effects
+      effect_population        = w_t * log(p / p_t1),
+      effect_affluence         = w_t * log(g / g_t1),
+      effect_energy_intensity  = w_t * log(i / i_t1),
+      effect_carbon_intensity  = w_t * log(f / f_t1),
+      effect_residual          = w_t * log(r / r_t1),
+      
+      # Convert absolute effects into baseline-relative percentage points
+      pct_effect_population       = (effect_population / co2_t1) * 100,
+      pct_effect_affluence        = (effect_affluence / co2_t1) * 100,
+      pct_effect_energy_intensity = (effect_energy_intensity / co2_t1) * 100,
+      pct_effect_carbon_intensity = (effect_carbon_intensity / co2_t1) * 100,
+      pct_effect_residual         = (effect_residual / co2_t1) * 100,
+      
+      # Actual total net % change of emissions
+      pct_change_co2              = (delta_co2 / co2_t1) * 100
+    )
+  
+  # ----------------------------------------------------------------------------
+  # STEPS 6 & 8: RESHAPE AND VISUALIZE THE RESULTS
+  # ----------------------------------------------------------------------------
+  df_lmdi_pct_long <- df_lmdi_pct %>%
+    select(year_end, pct_effect_population, pct_effect_affluence, 
+           pct_effect_energy_intensity, pct_effect_carbon_intensity, pct_effect_residual) %>%
+    pivot_longer(
+      cols = starts_with("pct_effect_"), 
+      names_to = "socioeconomic_driver", 
+      values_to = "percentage_contribution"
+    ) %>%
+    mutate(socioeconomic_driver = case_when(
+      socioeconomic_driver == "pct_effect_population"       ~ "Population Growth",
+      socioeconomic_driver == "pct_effect_affluence"        ~ "Economic Affluence (GDP/Capita)",
+      socioeconomic_driver == "pct_effect_energy_intensity" ~ "Energy Intensity (Energy/GDP)",
+      socioeconomic_driver == "pct_effect_carbon_intensity" ~ "Carbon Intensity (CO2/Energy)",
+      socioeconomic_driver == "pct_effect_residual"         ~ "Data Discrepancy Residual"
+    ))
+  
+  # Construct the individual percentage chart with overlaid net line
+  pct_plot <- ggplot() +
+    geom_col(
+      data = df_lmdi_pct_long, 
+      aes(x = year_end, y = percentage_contribution, fill = socioeconomic_driver)
+    ) + 
+    geom_line(
+      data = df_lmdi_pct, 
+      aes(x = year_end, y = pct_change_co2, group = 1, color = "Net CO₂ Change"), 
+      linewidth = 1
+    ) +
+    geom_point(
+      data = df_lmdi_pct, 
+      aes(x = year_end, y = pct_change_co2, color = "Net CO₂ Change"), 
+      size = 1.8
+    ) +
+    geom_hline(yintercept = 0, color = "black", size = 0.5) + 
+    labs(
+      title = paste("Kaya Identity LMDI Decomposition:", current_country),
+      subtitle = paste0("Annual percentage point contributions vs. total net CO₂ change (1994-", latest_year, ")"),
+      x = "Year",
+      y = "Emissions Change (Percentage Points / %)",
+      fill = "Kaya Identity Component",
+      color = "Total Trend"
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      legend.box = "vertical", 
+      legend.margin = margin(t = 2, r = 0, b = 2, l = 0, unit = "pt"),
+      legend.text = element_text(size = 7.5),                 
+      legend.title = element_text(size = 8.5, face = "bold"),  
+      legend.key.size = unit(0.35, "cm"),                     
+      legend.spacing.y = unit(0.05, "cm"),                    
+      plot.title = element_text(face = "bold", size = 13),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    ) +
+    scale_fill_brewer(palette = "Set2") +
+    scale_color_manual(values = c("Net CO₂ Change" = "#2c3e50")) +
+    guides(
+      fill = guide_legend(nrow = 2, title.position = "top", title.hjust = 0.5),
+      color = guide_legend(title.position = "top", title.hjust = 0.5)
+    )
+  
+  # (Optional) Keep printing them in your RStudio interface as they compile
+  print(pct_plot)
+  
+  # ----------------------------------------------------------------------------
+  # DYNAMIC GGSAVE IMPLEMENTATION WITH SNAKE_CASE FILENAMES
+  # ----------------------------------------------------------------------------
+  # Converts "United States" into "united_states" to build a clean filename string
+  clean_filename_string <- tolower(str_replace_all(current_country, " ", "_"))
+  output_filename <- paste0("kaya_lmdi_", clean_filename_string, ".png")
+  
+  ggsave(
+    filename = output_filename,
+    plot = pct_plot,
+    width = 22.0,
+    height = 14.0,
+    units = "cm",
+    dpi = 300
+  )
+  
+  message(paste("Saved file to workspace as:", output_filename))
+}
+
+message("All individual country files successfully saved!")
+```
