@@ -359,7 +359,7 @@ library(tidyverse)
 library(patchwork)
 
 # 1. Define your target list of 6 countries
-country_list <- c("United States", "Germany", "China", "Brazil", "India", "United Kingdom")
+country_list <- c("Argentina", "Mexico", "Chile", "Peru", "Brazil", "Panama")
 
 # 2. Initialize an empty list to store the generated plots
 saved_plots_list <- list()
